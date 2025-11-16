@@ -1,5 +1,6 @@
 import os
 import numpy as np
+import json
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
@@ -11,7 +12,6 @@ import io
 import base64
 import logging
 from datetime import datetime
-
 # Model-specific preprocessing
 from tensorflow.keras.applications.vgg16 import preprocess_input as vgg_preprocess
 
@@ -25,7 +25,14 @@ CORS(app)
 # Configuration
 UPLOAD_FOLDER = 'uploads'
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'bmp', 'tiff'}
-MODEL_PATH = 'models/vgg16_final.h5'
+
+# Model paths
+CNN_MODEL_PATH = 'models/cervical_cancer_cnn_results/cnn_cervical_cancer_model.h5'
+VGG16_MODEL_PATH = 'models/cervical_cancer_vgg16_results/vgg16_cervical_cancer_model.h5'
+
+# Metrics paths
+CNN_METRICS_PATH = 'models/cervical_cancer_cnn_results/cnn_evaluation_metrics.json'
+VGG16_METRICS_PATH = 'models/cervical_cancer_vgg16_results/vgg16_evaluation_metrics.json'
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
@@ -33,6 +40,8 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 # Create directories
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs('models', exist_ok=True)
+os.makedirs('models/cervical_cancer_cnn_results', exist_ok=True)
+os.makedirs('models/cervical_cancer_vgg16_results', exist_ok=True)
 
 # Class names (same as your training)
 CLASS_NAMES = [
@@ -42,30 +51,183 @@ CLASS_NAMES = [
     "Squamous cell carcinoma"
 ]
 
-# Global model variable
-model = None
+# Global model variables
+cnn_model = None
+vgg16_model = None
+vgg16_is_saved_model = False  # Flag to track if VGG16 is a SavedModel
 
-def load_model_once():
-    global model
-    if model is None:
+class SavedModelWrapper:
+    """Wrapper class to make SavedModel behave like a Keras model"""
+    def __init__(self, saved_model, signature_name='serving_default'):
+        self.saved_model = saved_model
+        self.signature = saved_model.signatures[signature_name]
+        
+        # Extract input and output keys from signature
         try:
-            model = load_model(MODEL_PATH)
-            logger.info("Model loaded successfully")
+            # Get input signature (usually in structured_input_signature[1])
+            sig_input = self.signature.structured_input_signature
+            if isinstance(sig_input, tuple) and len(sig_input) > 1:
+                self.input_key = list(sig_input[1].keys())[0]
+            else:
+                # Fallback: try to get from function args
+                self.input_key = list(sig_input.keys())[0] if isinstance(sig_input, dict) else 'input_1'
         except Exception as e:
-            logger.error(f"Error loading model: {str(e)}")
-            raise
-    return model
+            logger.warning(f"Could not determine input key from signature: {e}, using default")
+            self.input_key = 'input_1'
+    
+    def predict(self, x, verbose=0):
+        """Predict method compatible with Keras model.predict()"""
+        try:
+            # Convert numpy array to tensor if needed
+            if isinstance(x, np.ndarray):
+                x = tf.constant(x, dtype=tf.float32)
+            
+            # Call the signature with the input
+            output = self.signature(**{self.input_key: x})
+            
+            # Get the output (usually the first output or 'output_0')
+            if isinstance(output, dict):
+                output_key = list(output.keys())[0]
+                predictions = output[output_key].numpy()
+            else:
+                # If output is a single tensor
+                predictions = output.numpy()
+            
+            return predictions
+        except Exception as e:
+            logger.error(f"Error in SavedModelWrapper.predict: {str(e)}")
+            # Try alternative method: call directly without keyword
+            try:
+                output = self.signature(x)
+                if isinstance(output, dict):
+                    predictions = list(output.values())[0].numpy()
+                else:
+                    predictions = output.numpy()
+                return predictions
+            except Exception as e2:
+                logger.error(f"Alternative prediction method also failed: {str(e2)}")
+                raise
+
+def load_cnn_model():
+    global cnn_model
+    if cnn_model is None:
+        try:
+            # Try loading with compile=False first to avoid compilation issues
+            cnn_model = load_model(CNN_MODEL_PATH, compile=False)
+            logger.info("CNN model loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading CNN model: {str(e)}")
+            # Try loading with compile=True as fallback
+            try:
+                cnn_model = load_model(CNN_MODEL_PATH, compile=True)
+                logger.info("CNN model loaded successfully (with compile=True)")
+            except Exception as e2:
+                logger.error(f"Error loading CNN model with compile=True: {str(e2)}")
+                raise
+    return cnn_model
+
+def load_vgg16_model():
+    global vgg16_model, vgg16_is_saved_model
+    if vgg16_model is None:
+        saved_model_path = 'models/cervical_cancer_vgg16_results/vgg16_saved_model'
+        h5_model_path = VGG16_MODEL_PATH
+        
+        # Method 1: Try loading from saved_model directory using tf.saved_model.load (for Keras 3)
+        if os.path.exists(saved_model_path):
+            try:
+                logger.info("Attempting to load VGG16 from saved_model directory using tf.saved_model.load...")
+                saved_model_obj = tf.saved_model.load(saved_model_path)
+                
+                # Check available signatures
+                signatures = list(saved_model_obj.signatures.keys())
+                logger.info(f"Available signatures: {signatures}")
+                
+                # Use 'serving_default' if available, otherwise use the first signature
+                signature_name = 'serving_default' if 'serving_default' in signatures else signatures[0]
+                
+                # Wrap the SavedModel to make it compatible with Keras model interface
+                vgg16_model = SavedModelWrapper(saved_model_obj, signature_name=signature_name)
+                vgg16_is_saved_model = True
+                logger.info(f"VGG16 model loaded successfully from saved_model directory (using signature: {signature_name})")
+                return vgg16_model
+            except Exception as e1:
+                logger.warning(f"Error loading from saved_model directory: {str(e1)}")
+        
+        # Method 2: Try loading from .h5 file with compile=False
+        if os.path.exists(h5_model_path):
+            try:
+                logger.info("Attempting to load VGG16 from .h5 file...")
+                vgg16_model = load_model(h5_model_path, compile=False)
+                vgg16_is_saved_model = False
+                logger.info("VGG16 model loaded successfully from .h5 file (without compilation)")
+                return vgg16_model
+            except Exception as e2:
+                logger.warning(f"Error loading VGG16 .h5 with compile=False: {str(e2)}")
+                # Try with compile=True as last resort
+                try:
+                    vgg16_model = load_model(h5_model_path, compile=True)
+                    vgg16_is_saved_model = False
+                    logger.info("VGG16 model loaded successfully from .h5 file (with compilation)")
+                    return vgg16_model
+                except Exception as e3:
+                    logger.error(f"Error loading VGG16 .h5 with compile=True: {str(e3)}")
+        
+        # If all methods failed, raise an error
+        error_msg = "Failed to load VGG16 model. Tried saved_model directory and .h5 file."
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
+    
+    return vgg16_model
+
+def get_model(model_type):
+    """Get the appropriate model based on type"""
+    if model_type == 'cnn':
+        return load_cnn_model()
+    elif model_type == 'vgg16':
+        return load_vgg16_model()
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+
+def load_metrics(model_type):
+    """Load evaluation metrics from JSON file"""
+    try:
+        if model_type == 'cnn':
+            metrics_path = CNN_METRICS_PATH
+        elif model_type == 'vgg16':
+            metrics_path = VGG16_METRICS_PATH
+        else:
+            return None
+        
+        if os.path.exists(metrics_path):
+            with open(metrics_path, 'r') as f:
+                return json.load(f)
+        else:
+            logger.warning(f"Metrics file not found: {metrics_path}")
+            return None
+    except Exception as e:
+        logger.error(f"Error loading metrics: {str(e)}")
+        return None
 
 def allowed_file(filename):
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def preprocess_image(img, target_size=(224, 224)):
-    """Preprocess image for VGG16"""
+def preprocess_image(img, model_type='vgg16', target_size=(224, 224)):
+    """Preprocess image based on model type"""
     img = img.resize(target_size)
     img_array = image.img_to_array(img)
     img_array = np.expand_dims(img_array, axis=0)
-    img_array = vgg_preprocess(img_array)
+    
+    if model_type == 'vgg16':
+        # VGG16 requires specific preprocessing
+        img_array = vgg_preprocess(img_array)
+    elif model_type == 'cnn':
+        # CNN typically uses normalization to [0, 1]
+        img_array = img_array / 255.0
+    else:
+        # Default normalization
+        img_array = img_array / 255.0
+    
     return img_array
 
 @app.route('/api/predict', methods=['POST'])
@@ -77,10 +239,15 @@ def predict():
     if file.filename == '':
         return jsonify({'error': 'No file selected'}), 400
     
+    # Get model type from form data or default to 'vgg16'
+    model_type = request.form.get('model_type', 'vgg16').lower()
+    if model_type not in ['cnn', 'vgg16']:
+        return jsonify({'error': 'Invalid model type. Use "cnn" or "vgg16"'}), 400
+    
     if file and allowed_file(file.filename):
         try:
-            # Load model
-            model = load_model_once()
+            # Load appropriate model
+            model = get_model(model_type)
             
             # Save uploaded file temporarily
             filename = secure_filename(file.filename)
@@ -89,10 +256,10 @@ def predict():
             
             # Read and preprocess image
             img = Image.open(filepath).convert('RGB')
-            img_array = preprocess_image(img)
+            img_array = preprocess_image(img, model_type=model_type)
             
             # Make prediction
-            predictions = model.predict(img_array)
+            predictions = model.predict(img_array, verbose=0)
             predicted_class_idx = np.argmax(predictions[0])
             confidence = float(predictions[0][predicted_class_idx])
             
@@ -104,13 +271,14 @@ def predict():
                 'prediction': CLASS_NAMES[predicted_class_idx],
                 'confidence': confidence,
                 'class_index': int(predicted_class_idx),
+                'model_type': model_type,
                 'timestamp': datetime.now().isoformat(),
                 'all_predictions': {
                     CLASS_NAMES[i]: float(predictions[0][i]) for i in range(len(CLASS_NAMES))
                 }
             }
             
-            logger.info(f"Prediction: {result['prediction']} (Confidence: {confidence:.2f})")
+            logger.info(f"Prediction ({model_type.upper()}): {result['prediction']} (Confidence: {confidence:.2f})")
             return jsonify(result)
             
         except Exception as e:
@@ -122,11 +290,14 @@ def predict():
 @app.route('/api/health', methods=['GET'])
 def health_check():
     try:
-        model_status = "loaded" if model is not None else "not loaded"
+        cnn_status = "loaded" if cnn_model is not None else "not loaded"
+        vgg16_status = "loaded" if vgg16_model is not None else "not loaded"
         return jsonify({
             'status': 'healthy', 
-            'model_loaded': model is not None,
-            'model_status': model_status,
+            'cnn_model_loaded': cnn_model is not None,
+            'vgg16_model_loaded': vgg16_model is not None,
+            'cnn_status': cnn_status,
+            'vgg16_status': vgg16_status,
             'timestamp': datetime.now().isoformat()
         })
     except Exception as e:
@@ -136,12 +307,43 @@ def health_check():
 def get_classes():
     return jsonify({'classes': CLASS_NAMES})
 
-if __name__ == '__main__':
-    # Pre-load model on startup
-    try:
-        load_model_once()
-        logger.info("Server starting with pre-loaded model")
-    except Exception as e:
-        logger.warning(f"Could not pre-load model: {str(e)}")
+@app.route('/api/models', methods=['GET'])
+def get_models():
+    """Get available models and their status"""
+    return jsonify({
+        'available_models': ['cnn', 'vgg16'],
+        'cnn_loaded': cnn_model is not None,
+        'vgg16_loaded': vgg16_model is not None
+    })
+
+@app.route('/api/metrics/<model_type>', methods=['GET'])
+def get_metrics(model_type):
+    """Get evaluation metrics for a specific model"""
+    if model_type not in ['cnn', 'vgg16']:
+        return jsonify({'error': 'Invalid model type. Use "cnn" or "vgg16"'}), 400
     
+    metrics = load_metrics(model_type)
+    if metrics is None:
+        return jsonify({'error': 'Metrics not available for this model'}), 404
+    
+    return jsonify({
+        'model_type': model_type,
+        'metrics': metrics
+    })
+
+if __name__ == '__main__':
+    # Pre-load models on startup (optional - can be lazy loaded)
+    try:
+        load_cnn_model()
+        logger.info("CNN model pre-loaded")
+    except Exception as e:
+        logger.warning(f"Could not pre-load CNN model: {str(e)}")
+    
+    try:
+        load_vgg16_model()
+        logger.info("VGG16 model pre-loaded")
+    except Exception as e:
+        logger.warning(f"Could not pre-load VGG16 model: {str(e)}")
+    
+    logger.info("Server starting...")
     app.run(debug=True, host='0.0.0.0', port=5000)
